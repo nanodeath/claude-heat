@@ -23,6 +23,9 @@ from .config import Config
 IDLE_GLYPH = "✳"
 BUSY_GLYPHS = ("◐", "◑")
 
+# Seconds per spinner frame; Claude Code's own is about 0.96
+SPINNER_PERIOD = 1.0
+
 TICKS = os.sysconf("SC_CLK_TCK")
 
 CLAUDE_HOME = Path.home() / ".claude"
@@ -234,8 +237,9 @@ def read_meta(cpid: int) -> dict | None:
         return None  # gone, or caught mid-rewrite
 
 
-def sessions_by_cwd() -> dict[str, list[Session]]:
-    by_cwd: dict[str, list[Session]] = defaultdict(list)
+def live_sessions() -> dict[Session, str]:
+    """Each live interactive session, with its working directory."""
+    sessions = {}
     for path in SESSIONS.glob("*.json"):
         meta = read_meta(int(path.stem))
         if meta is None:
@@ -244,12 +248,15 @@ def sessions_by_cwd() -> dict[str, list[Session]]:
 
         # Headless sessions resolve to their parent's pty and don't count here
         if session and session[0] == meta["pid"]:
-            by_cwd[meta["cwd"]].append(session)
-    return by_cwd
+            sessions[session] = meta["cwd"]
+    return sessions
 
 
 def cores_by_session(prev: Sample, cur: Sample) -> dict[Session, float]:
-    by_cwd = sessions_by_cwd()
+    by_cwd: dict[str, list[Session]] = defaultdict(list)
+    for session, cwd in live_sessions().items():
+        by_cwd[cwd].append(session)
+
     totals: dict[Session, float] = defaultdict(float)
     for owner, cores in cores_by_owner(prev, cur).items():
         session = owner.session(by_cwd)
@@ -258,9 +265,36 @@ def cores_by_session(prev: Sample, cur: Sample) -> dict[Session, float]:
     return totals
 
 
-def flames(avg: float, config: Config) -> str:
-    """Flames for a hot session, which stays hot until it falls below cool_cores."""
-    return config.flame * max(1, sum(avg >= t for t in config.flame_thresholds))
+def flame_level(avg: float, hot: bool, config: Config) -> int:
+    """Flames the current average earns, before any ramp-down hold.
+
+    A hot session keeps one flame until its average drops below cool_cores.
+    """
+    level = sum(avg >= t for t in config.flame_thresholds)
+    if hot and avg >= config.cool_cores:
+        return max(1, level)
+    return level
+
+
+class Heat:
+    """One session's flame level, which rises at once and falls slowly.
+
+    The level shown is the highest one earned in the last ramp_down seconds.
+    """
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.recent: deque[int] = deque(maxlen=config.ramp_down_samples)
+        self.level = 0
+
+    def update(self, avg: float, window_full: bool) -> int:
+        hot = self.level > 0
+
+        # A session must fill its averaging window before it can turn hot
+        earned = flame_level(avg, hot, self.config) if hot or window_full else 0
+        self.recent.append(earned)
+        self.level = max(self.recent)
+        return self.level
 
 
 def project_name(cpid: int) -> str:
@@ -350,32 +384,63 @@ def run(config: Config) -> None:
     sampler = Sampler(config.docker)
     titles = Titles(config.status_glyphs)
     history: dict[Session, deque] = defaultdict(lambda: deque(maxlen=config.window_samples))
-    hot: set[Session] = set()
+    heat: dict[Session, Heat] = defaultdict(lambda: Heat(config))
+
+    # Last title written per pty, so unchanged titles aren't resent
+    written: dict[str, str] = {}
+
+    tick_period = min(config.interval, SPINNER_PERIOD)
     prev = sampler.sample()
+    next_sample = time.monotonic() + config.interval
 
     for tick in count():
-        time.sleep(config.interval)
-        cur = sampler.sample()
-        totals = cores_by_session(prev, cur)
-        prev = cur
+        time.sleep(tick_period)
+        now = time.monotonic()
+        if now >= next_sample:
+            # Skip ahead rather than catch up, as after a suspend
+            next_sample = max(next_sample + config.interval, now)
+            cur = sampler.sample()
+            update_heat(history, heat, cores_by_session(prev, cur), config)
+            prev = cur
 
-        for session in list(history):
-            if not os.path.exists(f"/proc/{session[0]}"):
-                del history[session]
-                hot.discard(session)
-        for session in set(history) | set(totals):
-            history[session].append(totals.get(session, 0.0))
+        sessions = live_sessions()
+        for tty in written.keys() - {tty for _, tty in sessions}:
+            del written[tty]
 
-        for session, samples in history.items():
-            avg = sum(samples) / len(samples)
+        for session in sessions:
             cpid, tty = session
-            full = len(samples) == config.window_samples
-            if session in hot and avg < config.cool_cores:
-                hot.discard(session)
-                set_title(tty, titles.default(cpid, tick))
-            elif session not in hot and full and avg >= config.flame_thresholds[0]:
-                hot.add(session)
+            level = heat[session].level if session in heat else 0
+            title = titles.default(cpid, tick)
+            if level:
+                title = f"{config.flame * level} {title}"
 
-            # Re-assert every tick so Claude Code's own title updates don't win
-            if session in hot:
-                set_title(tty, f"{flames(avg, config)} {titles.default(cpid, tick)}")
+            if config.write_all_titles:
+                if written.get(tty) != title:
+                    set_title(tty, title)
+                    written[tty] = title
+            elif level:
+                # Re-assert every tick so Claude Code's own title updates don't win
+                set_title(tty, title)
+                written[tty] = title
+            elif tty in written:
+                # Cooled down: hand the title back to Claude Code
+                set_title(tty, title)
+                del written[tty]
+
+
+def update_heat(
+    history: dict[Session, deque],
+    heat: dict[Session, Heat],
+    totals: dict[Session, float],
+    config: Config,
+) -> None:
+    for session in list(history):
+        if not os.path.exists(f"/proc/{session[0]}"):
+            del history[session]
+            heat.pop(session, None)
+    for session in set(history) | set(totals):
+        history[session].append(totals.get(session, 0.0))
+
+    for session, samples in history.items():
+        avg = sum(samples) / len(samples)
+        heat[session].update(avg, len(samples) == config.window_samples)

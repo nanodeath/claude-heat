@@ -1,5 +1,13 @@
 from claude_heat.config import Config
-from claude_heat.monitor import Container, Proc, Sample, Spawned, cores_by_owner, flames
+from claude_heat.monitor import (
+    Container,
+    Heat,
+    Proc,
+    Sample,
+    Spawned,
+    cores_by_owner,
+    flame_level,
+)
 
 A = Spawned(100)
 B = Spawned(200)
@@ -78,12 +86,56 @@ def test_container_skipped_when_sessions_share_its_directory():
     assert Container("/q").session(one) is None
 
 
-def test_flames_scale_with_thresholds():
+def test_flame_level_counts_thresholds_reached():
     config = Config()
-    assert flames(1.5, config) == "🔥"
-    assert flames(4.0, config) == "🔥🔥"
-    assert flames(12.0, config) == "🔥🔥🔥"
+    assert flame_level(1.0, False, config) == 0
+    assert flame_level(1.5, False, config) == 1
+    assert flame_level(4.0, False, config) == 2
+    assert flame_level(12.0, False, config) == 3
 
 
-def test_hot_session_below_first_threshold_keeps_one_flame():
-    assert flames(0.8, Config()) == "🔥"
+def test_hot_session_keeps_one_flame_until_below_cool_cores():
+    config = Config()
+    assert flame_level(0.8, True, config) == 1
+    assert flame_level(0.4, True, config) == 0
+
+
+def heat(**overrides) -> Heat:
+    return Heat(Config(**{"interval": 2.0, "ramp_down": 10.0, **overrides}))
+
+
+def test_heat_needs_a_full_window_to_turn_hot():
+    h = heat()
+    assert h.update(9.0, window_full=False) == 0
+    assert h.update(9.0, window_full=True) == 3
+
+
+def test_heat_rises_at_once():
+    h = heat()
+    assert h.update(2.0, True) == 1
+    assert h.update(9.0, True) == 3
+
+
+def test_heat_holds_its_peak_for_ramp_down():
+    # ramp_down 10s at 2s samples: a level shows for 5 samples, counting the
+    # one that earned it
+    h = heat()
+    h.update(9.0, True)
+    assert [h.update(0.0, True) for _ in range(5)] == [3, 3, 3, 3, 0]
+
+
+def test_heat_drops_to_the_lower_level_once_the_peak_expires():
+    h = heat()
+    h.update(9.0, True)
+    assert [h.update(2.0, True) for _ in range(5)] == [3, 3, 3, 3, 1]
+
+
+def test_brief_dip_does_not_blink():
+    h = heat()
+    shown = [h.update(avg, True) for avg in [5.0, 0.0, 0.0, 5.0, 0.0, 5.0]]
+    assert shown == [2, 2, 2, 2, 2, 2]
+
+
+def test_zero_ramp_down_follows_load_directly():
+    h = heat(ramp_down=0.0)
+    assert [h.update(avg, True) for avg in [9.0, 2.0, 0.0]] == [3, 1, 0]

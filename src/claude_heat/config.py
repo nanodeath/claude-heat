@@ -24,6 +24,9 @@ class Config:
     # A hot session cools down once its average drops below this
     cool_cores: float = 0.5
 
+    # Seconds a lower flame level must hold before the title drops to it
+    ramp_down: float = 30.0
+
     # Repeated once per threshold reached
     flame: str = "🔥"
 
@@ -33,9 +36,18 @@ class Config:
     # Credit Docker Compose containers to the session in their project directory
     docker: bool = True
 
+    # Write every session's title, not only hot ones. Pair with
+    # CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 so Claude Code stops writing its own,
+    # which otherwise overwrites the flames about once a second while busy.
+    write_all_titles: bool = False
+
     @property
     def window_samples(self) -> int:
         return max(1, round(self.window / self.interval))
+
+    @property
+    def ramp_down_samples(self) -> int:
+        return max(1, round(self.ramp_down / self.interval))
 
     def __post_init__(self) -> None:
         if self.interval <= 0:
@@ -48,6 +60,8 @@ class Config:
             raise ConfigError("flame_thresholds must be strictly increasing")
         if not 0 <= self.cool_cores < self.flame_thresholds[0]:
             raise ConfigError("cool_cores must be below the first flame threshold")
+        if self.ramp_down < 0:
+            raise ConfigError("ramp_down can't be negative")
 
 
 def default_path() -> Path:

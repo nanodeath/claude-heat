@@ -61,9 +61,11 @@ Settings are read from `~/.config/claude-heat/config.toml`, or from `$XDG_CONFIG
 | `window` | `10.0` | Seconds of samples averaged before a session turns hot or cools down |
 | `flame_thresholds` | `[1.5, 4.0, 8.0]` | Cores needed for one, two, three… flames. The first value marks a session hot. |
 | `cool_cores` | `0.5` | A hot session cools down below this average |
+| `ramp_down` | `30.0` | Seconds a lower flame level must hold before the title drops to it |
 | `flame` | `"🔥"` | The marker, repeated once per threshold reached |
 | `status_glyphs` | `true` | Keep Claude Code's ✳ / ◐ / ◑ status glyph in titles |
 | `docker` | `true` | Credit Docker Compose containers to sessions |
+| `write_all_titles` | `false` | Write every session's title, not only hot ones. See below. |
 
 Unknown settings and bad values stop the program with an error.
 
@@ -72,6 +74,28 @@ Restart the service after editing:
 ```sh
 systemctl --user restart claude-heat
 ```
+
+### Stopping the flicker
+
+While a session is busy, Claude Code redraws its own title about once a second to animate its spinner. Each redraw replaces claude-heat's title, so the flames blink on and off. To stop that, turn off Claude Code's title and let claude-heat write every title, spinner included.
+
+In `~/.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"
+  }
+}
+```
+
+In `~/.config/claude-heat/config.toml`:
+
+```toml
+write_all_titles = true
+```
+
+Sessions started before the settings change keep writing their own titles until you restart them. While claude-heat isn't running, tabs keep their last title and the spinner stops.
 
 ## How it works
 
@@ -87,15 +111,18 @@ For each process, claude-heat reads its CPU time plus the CPU time of children i
 
 ### Setting titles
 
-claude-heat writes a title escape sequence to the session's terminal device, such as `/dev/pts/5`. A hot session's title is rewritten on every sample, because Claude Code sets its own title too. The title is rebuilt from the session's generated name in its transcript and its busy or idle status. When the session cools down, claude-heat writes the plain title once and leaves it to Claude Code again.
+claude-heat writes a title escape sequence to the session's terminal device, such as `/dev/pts/5`. It rebuilds Claude Code's title from the session's generated name in its transcript and its busy or idle status, then puts the flames in front.
+
+Flames rise as soon as the average load crosses a threshold. They fall only after the lower level has held for `ramp_down` seconds, so short pauses in a build or test run don't make them blink.
+
+With `write_all_titles` off, claude-heat rewrites a hot session's title every second so it wins over Claude Code's own title. When the session cools down, it writes the plain title once and hands the title back to Claude Code. With `write_all_titles` on, claude-heat writes every session's title, and only when it changes.
 
 ## Limitations
 
 - **Undocumented internals.** claude-heat relies on details of Claude Code that aren't a public interface. These include the `CLAUDE_PID` variable, the session files in `~/.claude/sessions/`, the `ai-title` entries in transcripts, and the title glyphs. A Claude Code update could change any of them.
 - **Remote work isn't counted.** Load on other machines, from `ssh` for example, doesn't count. It doesn't heat this machine either.
 - **Some containers can't be credited.** That covers containers started without Compose, and containers whose directory has more than one session in it.
-- **Titles can flicker.** Claude Code and claude-heat both write the title. While a session is hot, the title may briefly show Claude Code's version between samples.
-- **The spinner may not match.** claude-heat's ◐/◑ spinner advances once per sample, which may not match Claude Code's pace.
+- **Flicker without `write_all_titles`.** Unless you turn off Claude Code's title as described in [Stopping the flicker](#stopping-the-flicker), a busy, hot session's flames blink about once a second.
 
 ## Privacy
 

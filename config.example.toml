@@ -14,6 +14,9 @@ flame_thresholds = [1.5, 4.0, 8.0]
 # A hot session cools down once its average drops below this
 cool_cores = 0.5
 
+# Seconds a lower flame level must hold before the title drops to it
+ramp_down = 30.0
+
 # Repeated once per threshold reached
 flame = "🔥"
 
@@ -22,3 +25,8 @@ status_glyphs = true
 
 # Credit Docker Compose containers to the session in their project directory
 docker = true
+
+# Write every session's title, not only hot ones. Pair with
+# CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 so Claude Code stops writing its own,
+# which otherwise overwrites the flames about once a second while busy.
+write_all_titles = false
