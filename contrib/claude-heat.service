@@ -1,0 +1,11 @@
+[Unit]
+Description=Show CPU-heavy Claude Code sessions in terminal tab titles
+
+[Service]
+ExecStart=%h/.local/bin/claude-heat
+Restart=on-failure
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=default.target

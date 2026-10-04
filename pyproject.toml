@@ -1,0 +1,34 @@
+[project]
+name = "claude-heat"
+version = "0.1.0"
+description = "Show which Claude Code sessions are driving CPU load in their terminal tab titles"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["claude-code", "ghostty", "cpu", "terminal", "monitoring"]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Monitoring",
+]
+authors = [
+    { name = "Max Aller", email = "nanodeath@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/nanodeath/claude-heat"
+
+[project.scripts]
+claude-heat = "claude_heat:main"
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

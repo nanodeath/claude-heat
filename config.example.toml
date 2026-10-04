@@ -1,0 +1,24 @@
+# claude-heat settings. Copy to ~/.config/claude-heat/config.toml and keep
+# only the lines you change; anything left out uses the default shown here.
+
+# Seconds between CPU samples
+interval = 2.0
+
+# Seconds of samples averaged before a session turns hot or cools down
+window = 10.0
+
+# Cores needed for one, two, three... flames. The first value marks a session
+# hot. Add or remove values to change how many flames can appear.
+flame_thresholds = [1.5, 4.0, 8.0]
+
+# A hot session cools down once its average drops below this
+cool_cores = 0.5
+
+# Repeated once per threshold reached
+flame = "🔥"
+
+# Keep Claude Code's ✳ / ◐ / ◑ status glyph in titles we write
+status_glyphs = true
+
+# Credit Docker Compose containers to the session in their project directory
+docker = true
