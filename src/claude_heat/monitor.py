@@ -9,7 +9,10 @@ to the one session whose working directory is the Compose project directory.
 import json
 import os
 import re
+import shutil
 import subprocess
+import sys
+import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -32,6 +35,10 @@ CLAUDE_HOME = Path.home() / ".claude"
 SESSIONS = CLAUDE_HOME / "sessions"
 PROJECTS = CLAUDE_HOME / "projects"
 TAIL_BYTES = 256 * 1024
+
+# Claude Code's title generator gives up on prompts shorter than this
+MIN_PROMPT_CHARS = 10
+TITLE_TIMEOUT = 60.0
 
 DOCKER_SCOPE = re.compile(r"docker-([0-9a-f]{64})\.scope")
 COMPOSE_DIR_LABEL = '{{index .Config.Labels "com.docker.compose.project.working_dir"}}'
@@ -314,13 +321,144 @@ def last_ai_title(path: Path, start: int) -> str | None:
     return None
 
 
+def message_text(content: str | list) -> str:
+    if isinstance(content, str):
+        return content
+    return "\n".join(part["text"] for part in content if part.get("type") == "text")
+
+
+def first_human_prompt(path: Path, start: int) -> tuple[str | None, int]:
+    """The first prompt a person typed at or after byte `start`, and where the scan stopped.
+
+    Short prompts are skipped, as Claude Code's own title generator skips them.
+    """
+    with open(path, "rb") as f:
+        f.seek(start)
+        data = f.read()
+
+    # A partly written last line waits for the next scan
+    end = data.rfind(b"\n") + 1
+    for line in data[:end].splitlines():
+        if b'"kind":"human"' not in line:
+            continue
+        entry = json.loads(line)
+        if entry["type"] != "user" or entry.get("origin", {}).get("kind") != "human":
+            continue
+        text = message_text(entry["message"]["content"]).strip()
+        if len(text) >= MIN_PROMPT_CHARS:
+            return text, start + end
+    return None, start + end
+
+
+def generate_title(command: list[str], prompt: str) -> str | None:
+    """Ask Claude Code's built-in title generator to name a prompt.
+
+    The generator is reachable as the generate_session_title control request
+    of a headless `claude`. Claude Code skips it in sessions started with
+    CLAUDE_CODE_DISABLE_TERMINAL_TITLE set, so those never get an ai-title.
+    """
+    request = {
+        "type": "control_request",
+        "request_id": "title",
+        "request": {"subtype": "generate_session_title", "description": prompt, "persist": False},
+    }
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        cwd=Path.home(),
+        text=True,
+        encoding="utf-8",
+    )
+    timer = threading.Timer(TITLE_TIMEOUT, proc.kill)
+    timer.start()
+    try:
+        # stdin stays open until the reply; claude exits early once it closes
+        proc.stdin.write(json.dumps(request) + "\n")
+        proc.stdin.flush()
+        for line in proc.stdout:
+            message = json.loads(line)
+            if message["type"] != "control_response":
+                continue
+            response = message["response"]
+            if response["subtype"] != "success":
+                log(f"title request failed: {response.get('error')}")
+                return None
+            return response["response"]["title"]
+        log(f"claude exited without naming the session (status {proc.wait()})")
+        return None
+    finally:
+        timer.cancel()
+        proc.stdin.close()
+        proc.wait()
+
+
+def title_command() -> list[str] | None:
+    # systemd's default PATH leaves out ~/.local/bin, where Claude Code installs itself
+    path = os.pathsep.join([os.environ.get("PATH", ""), str(Path.home() / ".local" / "bin")])
+    claude = shutil.which("claude", path=path)
+    if claude is None:
+        log("claude not found, so untitled sessions keep the project name")
+        return None
+    return [
+        claude,
+        "--print",
+        "--input-format=stream-json",
+        "--output-format=stream-json",
+        "--verbose",
+        "--no-session-persistence",
+        "--settings",
+        '{"disableAllHooks": true}',
+    ]
+
+
+def log(message: str) -> None:
+    print(f"claude-heat: {message}", file=sys.stderr, flush=True)
+
+
+class Namer:
+    """Names untitled sessions in the background, once per session.
+
+    Each request starts a headless `claude` and takes a few seconds, so it
+    runs on its own thread and the title loop never waits for it.
+    """
+
+    def __init__(self, command: list[str]):
+        self.command = command
+        self.threads: dict[str, threading.Thread] = {}
+        self.names: dict[str, str | None] = {}
+
+    def name(self, session_id: str, prompt: str) -> str | None:
+        """The generated name, or None while it's pending or if it failed."""
+        if session_id not in self.threads:
+            thread = threading.Thread(target=self.generate, args=(session_id, prompt), daemon=True)
+            self.threads[session_id] = thread
+            thread.start()
+        return self.names.get(session_id)
+
+    def generate(self, session_id: str, prompt: str) -> None:
+        self.names[session_id] = generate_title(self.command, prompt)
+
+    def wait(self) -> None:
+        for thread in list(self.threads.values()):
+            thread.join()
+
+
 class Titles:
     """Rebuilds the title Claude Code shows for a session."""
 
-    def __init__(self, status_glyphs: bool):
+    def __init__(self, status_glyphs: bool, namer: Namer | None):
         self.status_glyphs = status_glyphs
+        self.namer = namer
         self.transcripts: dict[str, Path] = {}
-        self.names: dict[Path, str] = {}
+
+        # Newest ai-title per transcript already read in full
+        self.names: dict[Path, str | None] = {}
+
+        # First prompt per transcript, or how far the search for one has read
+        self.prompts: dict[Path, str] = {}
+        self.scanned: dict[Path, int] = {}
 
     def default(self, cpid: int, tick: int) -> str:
         meta = read_meta(cpid)
@@ -332,34 +470,57 @@ class Titles:
         return f"{glyph} {name}"
 
     def session_name(self, cpid: int, meta: dict | None) -> str:
-        """The session's generated name, or the project name before it has one.
+        """The name Claude Code would show, or the project name before one exists.
+
+        Like Claude Code, this prefers a /rename name, then the generated title.
+        """
+        if meta is None:
+            return project_name(cpid)
+        if meta.get("nameSource") == "user":
+            name = meta["name"]
+        else:
+            try:
+                name = self.transcript_name(meta["sessionId"])
+            except (OSError, StopIteration):
+                name = None  # transcript not written yet, or session exited mid-tick
+        if name is None:
+            return project_name(cpid)
+
+        # Model-written text; strip control chars so it can't break the escape
+        return "".join(ch for ch in name if ch >= " ")
+
+    def transcript_name(self, session_id: str) -> str | None:
+        """The session's newest ai-title, or a title generated from its first prompt.
 
         Claude Code appends an ai-title entry to the transcript as the name
         evolves, so the newest one sits near the end. Only the tail is
         rescanned after the first lookup.
         """
-        if meta is None:
-            return project_name(cpid)
-        try:
-            session_id = meta["sessionId"]
-            if session_id not in self.transcripts:
-                self.transcripts[session_id] = next(PROJECTS.glob(f"*/{session_id}.jsonl"))
-            path = self.transcripts[session_id]
+        if session_id not in self.transcripts:
+            self.transcripts[session_id] = next(PROJECTS.glob(f"*/{session_id}.jsonl"))
+        path = self.transcripts[session_id]
 
-            name = self.names.get(path)
-            if name is None:
-                name = last_ai_title(path, 0)
-            else:
-                name = last_ai_title(path, max(0, path.stat().st_size - TAIL_BYTES)) or name
-        except (OSError, StopIteration):
-            name = None  # transcript not written yet, or session exited mid-tick
-
-        if name is None:
-            return project_name(cpid)
+        if path in self.names:
+            tail = max(0, path.stat().st_size - TAIL_BYTES)
+            name = last_ai_title(path, tail) or self.names[path]
+        else:
+            name = last_ai_title(path, 0)
         self.names[path] = name
+        if name is not None:
+            return name
 
-        # Model-written text; strip control chars so it can't break the escape
-        return "".join(ch for ch in name if ch >= " ")
+        if self.namer is None:
+            return None
+        if path not in self.prompts:
+            prompt, self.scanned[path] = first_human_prompt(path, self.scanned.get(path, 0))
+            if prompt is None:
+                return None
+            self.prompts[path] = prompt
+        return self.namer.name(session_id, self.prompts[path])
+
+    def wait_for_names(self) -> None:
+        if self.namer is not None:
+            self.namer.wait()
 
 
 def set_title(tty: str, title: str) -> None:
@@ -370,19 +531,30 @@ def set_title(tty: str, title: str) -> None:
         pass  # session exited between sample and write
 
 
+def make_titles(config: Config) -> Titles:
+    command = title_command() if config.generate_titles else None
+    return Titles(config.status_glyphs, Namer(command) if command else None)
+
+
 def print_once(config: Config) -> None:
     sampler = Sampler(config.docker)
-    titles = Titles(config.status_glyphs)
+    titles = make_titles(config)
     prev = sampler.sample()
     time.sleep(config.interval)
     totals = cores_by_session(prev, sampler.sample())
+
+    # Start naming any untitled sessions, then wait so the printout shows the names
+    for cpid, _ in totals:
+        titles.default(cpid, 0)
+    titles.wait_for_names()
+
     for (cpid, tty), cores in sorted(totals.items(), key=lambda x: -x[1]):
         print(f"{cores:5.2f} cores  {tty:<11} pid {cpid:<8} {titles.default(cpid, 0)}")
 
 
 def run(config: Config) -> None:
     sampler = Sampler(config.docker)
-    titles = Titles(config.status_glyphs)
+    titles = make_titles(config)
     history: dict[Session, deque] = defaultdict(lambda: deque(maxlen=config.window_samples))
     heat: dict[Session, Heat] = defaultdict(lambda: Heat(config))
 

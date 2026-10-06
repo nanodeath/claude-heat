@@ -41,6 +41,11 @@ class Config:
     # which otherwise overwrites the flames about once a second while busy.
     write_all_titles: bool = False
 
+    # Name sessions that have no title with Claude Code's own title generator.
+    # Sessions started with CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 never get one.
+    # Costs one small model call per session, made through a headless claude.
+    generate_titles: bool = True
+
     @property
     def window_samples(self) -> int:
         return max(1, round(self.window / self.interval))
