@@ -1,12 +1,16 @@
 import json
+import os
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
 from claude_heat import monitor
-from claude_heat.monitor import Titles, first_human_prompt, generate_title
+from claude_heat.monitor import Titles, first_human_prompt, generate_title, last_ai_title
 
 SESSION = "abc-123"
+LONG_AGO = "2026-01-01T00:00:00.000Z"
 
 
 def entry(**fields) -> str:
@@ -14,8 +18,13 @@ def entry(**fields) -> str:
     return json.dumps(fields, separators=(",", ":")) + "\n"
 
 
-def human(content) -> str:
-    return entry(type="user", origin={"kind": "human"}, message={"role": "user", "content": content})
+def human(content, typed: str = LONG_AGO) -> str:
+    return entry(
+        type="user",
+        origin={"kind": "human"},
+        message={"role": "user", "content": content},
+        timestamp=typed,
+    )
 
 
 def test_first_human_prompt_skips_commands_tool_results_and_short_prompts(tmp_path):
@@ -28,7 +37,8 @@ def test_first_human_prompt_skips_commands_tool_results_and_short_prompts(tmp_pa
         + human([{"type": "image"}, {"type": "text", "text": "Why is the build slow?"}])
     )
     prompt, _ = first_human_prompt(path, 0)
-    assert prompt == "Why is the build slow?"
+    assert prompt.text == "Why is the build slow?"
+    assert prompt.typed == datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
 def test_first_human_prompt_resumes_after_a_partly_written_line(tmp_path):
@@ -41,7 +51,7 @@ def test_first_human_prompt_resumes_after_a_partly_written_line(tmp_path):
 
     path.write_text(entry(type="mode") + line)
     prompt, _ = first_human_prompt(path, offset)
-    assert prompt == "Fix the flaky integration tests"
+    assert prompt.text == "Fix the flaky integration tests"
 
 
 def fake_claude(reply: dict) -> list[str]:
@@ -113,3 +123,39 @@ def test_untitled_session_is_named_from_its_first_prompt(transcript):
     titles = Titles(status_glyphs=False, namer=namer)
     assert titles.session_name(1, meta()) == "Generated name"
     assert namer.asked == [(SESSION, "Refactor the auth middleware")]
+
+
+def test_recent_prompt_waits_for_claude_codes_own_title(transcript):
+    now = datetime.now(timezone.utc).isoformat()
+    transcript.write_text(human("Refactor the auth middleware", typed=now))
+    namer = FakeNamer()
+    titles = Titles(status_glyphs=False, namer=namer)
+    assert titles.session_name(os.getpid(), meta()) == Path.cwd().name
+    assert namer.asked == []
+
+
+def test_last_ai_title_skips_the_line_a_tail_read_cuts(tmp_path):
+    path = tmp_path / "t.jsonl"
+    older = entry(type="ai-title", aiTitle="Older")
+    newer = entry(type="ai-title", aiTitle="Newer")
+    path.write_text(older + newer)
+
+    # Starting one byte in leaves '"type":"ai-title",...', which isn't JSON
+    assert last_ai_title(path, len(older) + 1) is None
+    assert last_ai_title(path, 1) == "Newer"
+
+
+def test_last_ai_title_skips_a_partly_written_line(tmp_path):
+    path = tmp_path / "t.jsonl"
+    path.write_text(entry(type="ai-title", aiTitle="Done") + entry(type="ai-title", aiTitle="Half")[:30])
+    assert last_ai_title(path, 0) == "Done"
+
+
+def test_control_characters_are_stripped_from_names(transcript, monkeypatch):
+    with open(transcript, "a") as f:
+        f.write(entry(type="ai-title", aiTitle="Fix\x1b]0;pwned\x07 it\x9c\x7f"))
+    titles = Titles(status_glyphs=False, namer=None)
+    assert titles.session_name(1, meta()) == "Fix]0;pwned it"
+
+    monkeypatch.setattr(monitor, "project_name", lambda cpid: "my\x07project")
+    assert titles.session_name(1, None) == "myproject"

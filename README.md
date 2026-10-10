@@ -129,7 +129,7 @@ claude-heat picks a session's name in the same order Claude Code does:
 3. A name claude-heat generates, when `generate_titles` is on
 4. The project directory's name
 
-Claude Code skips step 2 for sessions started with `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` set. For those sessions, claude-heat takes the first prompt you typed and runs a headless `claude` that sends it to Claude Code's own title generator. The prompt goes through the `generate_session_title` control request, so the names match the ones Claude Code would have made. Each session is named once per claude-heat run, and the name takes a few seconds to appear.
+Claude Code skips step 2 for sessions started with `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` set. For those sessions, claude-heat takes the first prompt you typed and runs a headless `claude` that sends it to Claude Code's own title generator. The prompt goes through the `generate_session_title` control request, so the names match the ones Claude Code would have made. Each session is named once per claude-heat run. claude-heat waits 20 seconds after the first prompt before asking, so sessions that get their own `ai-title` in that time are never named twice.
 
 The headless `claude` runs with hooks disabled and doesn't save a transcript. claude-heat finds it on `PATH` or in `~/.local/bin`.
 

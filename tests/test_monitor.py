@@ -1,9 +1,16 @@
+import os
+import subprocess
+
+import pytest
+
+from claude_heat import monitor
 from claude_heat.config import Config
 from claude_heat.monitor import (
     Container,
     Heat,
     Proc,
     Sample,
+    Sampler,
     Spawned,
     cores_by_owner,
     flame_level,
@@ -139,3 +146,29 @@ def test_brief_dip_does_not_blink():
 def test_zero_ramp_down_follows_load_directly():
     h = heat(ramp_down=0.0)
     assert [h.update(avg, True) for avg in [9.0, 2.0, 0.0]] == [3, 1, 0]
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError("docker"), subprocess.TimeoutExpired("docker", 5)])
+def test_docker_failure_leaves_container_uncredited(monkeypatch, error):
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(monitor.subprocess, "run", fail)
+    assert Sampler(docker=True).compose_workdir("ab" * 32) is None
+
+
+def test_print_lists_sessions_that_have_no_processes(tmp_path, monkeypatch, capsys):
+    class IdleSampler:
+        def __init__(self, docker):
+            pass
+
+        def sample(self):
+            return Sample(now=0, procs={})
+
+    monkeypatch.setattr(monitor, "SESSIONS", tmp_path)
+    monkeypatch.setattr(monitor, "Sampler", IdleSampler)
+    monkeypatch.setattr(monitor, "live_sessions", lambda: {(os.getpid(), "/dev/pts/9"): "/p"})
+    monkeypatch.setattr(monitor, "cores_by_session", lambda prev, cur: {})
+
+    monitor.print_once(Config(interval=0.01, window=0.01, generate_titles=False))
+    assert "0.00 cores  /dev/pts/9" in capsys.readouterr().out

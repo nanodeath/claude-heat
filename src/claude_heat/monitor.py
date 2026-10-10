@@ -14,8 +14,10 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from itertools import count
 from pathlib import Path
 from typing import NamedTuple
@@ -40,8 +42,13 @@ TAIL_BYTES = 256 * 1024
 MIN_PROMPT_CHARS = 10
 TITLE_TIMEOUT = 60.0
 
+# Claude Code writes its own ai-title a few seconds after the first prompt
+# unless titles are disabled, so generating one waits this long
+TITLE_DELAY = 20.0
+
 DOCKER_SCOPE = re.compile(r"docker-([0-9a-f]{64})\.scope")
 COMPOSE_DIR_LABEL = '{{index .Config.Labels "com.docker.compose.project.working_dir"}}'
+DOCKER_TIMEOUT = 5.0
 
 Session = tuple[int, str]  # (claude pid, pty path)
 ProcKey = tuple[int, int]  # (pid, starttime), unique across pid reuse
@@ -181,11 +188,17 @@ class Sampler:
 
     def compose_workdir(self, container_id: str) -> str | None:
         if container_id not in self.workdirs:
-            result = subprocess.run(
-                ["docker", "inspect", "-f", COMPOSE_DIR_LABEL, container_id],
-                capture_output=True,
-                text=True,
-            )
+            try:
+                result = subprocess.run(
+                    ["docker", "inspect", "-f", COMPOSE_DIR_LABEL, container_id],
+                    capture_output=True,
+                    text=True,
+                    timeout=DOCKER_TIMEOUT,
+                )
+            except (OSError, subprocess.TimeoutExpired) as e:
+                log(f"docker inspect failed, so container {container_id[:12]} isn't credited: {e}")
+                self.workdirs[container_id] = None
+                return None
 
             # Exits non-zero if the container is already gone
             workdir = result.stdout.strip() if result.returncode == 0 else ""
@@ -312,13 +325,19 @@ def project_name(cpid: int) -> str:
 
 
 def last_ai_title(path: Path, start: int) -> str | None:
+    found = None
     with open(path, "rb") as f:
         f.seek(start)
-        lines = f.read().splitlines()
-    for line in reversed(lines):
-        if b'"type":"ai-title"' in line:
-            return json.loads(line)["aiTitle"]
-    return None
+
+        # A tail read starts mid-line
+        if start > 0:
+            f.readline()
+
+        # A line without its newline is still being written
+        for line in f:
+            if line.endswith(b"\n") and b'"type":"ai-title"' in line:
+                found = line
+    return json.loads(found)["aiTitle"] if found else None
 
 
 def message_text(content: str | list) -> str:
@@ -327,27 +346,34 @@ def message_text(content: str | list) -> str:
     return "\n".join(part["text"] for part in content if part.get("type") == "text")
 
 
-def first_human_prompt(path: Path, start: int) -> tuple[str | None, int]:
+class Prompt(NamedTuple):
+    text: str
+    typed: datetime
+
+
+def first_human_prompt(path: Path, start: int) -> tuple[Prompt | None, int]:
     """The first prompt a person typed at or after byte `start`, and where the scan stopped.
 
     Short prompts are skipped, as Claude Code's own title generator skips them.
     """
+    end = start
     with open(path, "rb") as f:
         f.seek(start)
-        data = f.read()
+        for line in f:
+            # A partly written last line waits for the next scan
+            if not line.endswith(b"\n"):
+                break
+            end += len(line)
 
-    # A partly written last line waits for the next scan
-    end = data.rfind(b"\n") + 1
-    for line in data[:end].splitlines():
-        if b'"kind":"human"' not in line:
-            continue
-        entry = json.loads(line)
-        if entry["type"] != "user" or entry.get("origin", {}).get("kind") != "human":
-            continue
-        text = message_text(entry["message"]["content"]).strip()
-        if len(text) >= MIN_PROMPT_CHARS:
-            return text, start + end
-    return None, start + end
+            if b'"kind":"human"' not in line:
+                continue
+            entry = json.loads(line)
+            if entry["type"] != "user" or entry.get("origin", {}).get("kind") != "human":
+                continue
+            text = message_text(entry["message"]["content"]).strip()
+            if len(text) >= MIN_PROMPT_CHARS:
+                return Prompt(text, datetime.fromisoformat(entry["timestamp"])), end
+    return None, end
 
 
 def generate_title(command: list[str], prompt: str) -> str | None:
@@ -457,7 +483,7 @@ class Titles:
         self.names: dict[Path, str | None] = {}
 
         # First prompt per transcript, or how far the search for one has read
-        self.prompts: dict[Path, str] = {}
+        self.prompts: dict[Path, Prompt] = {}
         self.scanned: dict[Path, int] = {}
 
     def default(self, cpid: int, tick: int) -> str:
@@ -474,20 +500,20 @@ class Titles:
 
         Like Claude Code, this prefers a /rename name, then the generated title.
         """
-        if meta is None:
-            return project_name(cpid)
-        if meta.get("nameSource") == "user":
+        name = None
+        if meta is not None and meta.get("nameSource") == "user":
             name = meta["name"]
-        else:
+        elif meta is not None:
             try:
                 name = self.transcript_name(meta["sessionId"])
             except (OSError, StopIteration):
-                name = None  # transcript not written yet, or session exited mid-tick
+                pass  # transcript not written yet, or session exited mid-tick
         if name is None:
-            return project_name(cpid)
+            name = project_name(cpid)
 
-        # Model-written text; strip control chars so it can't break the escape
-        return "".join(ch for ch in name if ch >= " ")
+        # Models, users and directory names all supply names, so drop the
+        # C0, DEL and C1 controls a terminal could act on
+        return "".join(ch for ch in name if unicodedata.category(ch) != "Cc")
 
     def transcript_name(self, session_id: str) -> str | None:
         """The session's newest ai-title, or a title generated from its first prompt.
@@ -516,7 +542,13 @@ class Titles:
             if prompt is None:
                 return None
             self.prompts[path] = prompt
-        return self.namer.name(session_id, self.prompts[path])
+        prompt = self.prompts[path]
+
+        # Give Claude Code the chance to write its own ai-title first
+        waited = (datetime.now(timezone.utc) - prompt.typed).total_seconds()
+        if waited < TITLE_DELAY:
+            return None
+        return self.namer.name(session_id, prompt.text)
 
     def wait_for_names(self) -> None:
         if self.namer is not None:
@@ -541,7 +573,9 @@ def print_once(config: Config) -> None:
     titles = make_titles(config)
     prev = sampler.sample()
     time.sleep(config.interval)
-    totals = cores_by_session(prev, sampler.sample())
+
+    # A session with no processes of its own has no total but still belongs here
+    totals = {session: 0.0 for session in live_sessions()} | cores_by_session(prev, sampler.sample())
 
     # Start naming any untitled sessions, then wait so the printout shows the names
     for cpid, _ in totals:
