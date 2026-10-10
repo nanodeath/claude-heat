@@ -10,6 +10,8 @@ When several [Claude Code](https://claude.com/claude-code) sessions run at once 
 
 It counts the processes a session launched, not the Claude Code process itself. Builds, test runs, background jobs, and Docker Compose containers all count.
 
+claude-heat is an unofficial tool. It isn't made or endorsed by Anthropic.
+
 ## Requirements
 
 - Linux, since it reads `/proc`
@@ -49,7 +51,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now claude-heat
 ```
 
-The unit expects the executable at `~/.local/bin/claude-heat`, which is where `uv tool` and `pipx` put it. Edit `ExecStart` if yours is elsewhere. claude-heat uses about 1% of one core.
+The unit expects the executable at `~/.local/bin/claude-heat`, which is where `uv tool` and `pipx` put it. Edit `ExecStart` if yours is elsewhere. claude-heat uses under 1% of one core.
 
 ## Configuration
 
